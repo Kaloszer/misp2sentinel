@@ -21,24 +21,33 @@ if config.misp_verifycert is False:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def _get_misp_events_stix():
-    logging.info(f"Using the following values for MISP API call: domain: {config.misp_domain}, misp API key: {config.misp_key[:-5] + '*' + '*' + '*' + '*' + '*'}...")
+    logging.info(f"Using the following values for MISP API call: domain: {config.misp_domain}, misp API key: {config.misp_key[:-5] + '*****'}...")
     misp = PyMISP(config.misp_domain, config.misp_key, config.misp_verifycert, False)
     result_set = []
     logging.debug("Query MISP for events.")
     remaining_misp_pages = True
     misp_page = 1
     misp_indicator_ids = []
+    total_pages = None
 
     while remaining_misp_pages:
         try:
+            logging.info(f"Processing MISP page {misp_page}" + (f" of ~{total_pages}" if total_pages else ""))
             if "limit" in config.misp_event_filters:
                 result = misp.search(controller='events', return_format='json', **config.misp_event_filters)
             else:
                 result = misp.search(controller='events', return_format='json', **config.misp_event_filters, limit=config.misp_event_limit_per_page, page=misp_page)
 
             if len(result) > 0:
+                # Calculate estimated total pages on first result
+                if total_pages is None and "limit" not in config.misp_event_filters:
+                    # Assuming the first page is representative of the total number of events
+                    total_pages = (len(result) + config.misp_event_limit_per_page - 1) // config.misp_event_limit_per_page
+                    logging.info(f"Estimated total pages: {total_pages}")
+
                 logging.info("Received MISP events page {} with {} events".format(misp_page, len(result)))
-                for event in result:
+                for index, event in enumerate(result):
+                    logging.info("Processing event {}".format(index + 1))
                     misp_event = RequestObject_Event(event["Event"])
                     parser = MISPtoSTIX21Parser()
                     parser.parse_misp_event(event)
@@ -70,15 +79,16 @@ def _get_misp_events_stix():
                 logging.debug("Processed {} indicators.".format(len(result_set)))
                 misp_page += 1
             else:
+                logging.info("No more events to process.")
                 remaining_misp_pages = False
 
         except Exception as e:
             remaining_misp_pages = False
             logging.error("Error when processing data from MISP {}".format(e))
-
+    logging.info("Finished processing MISP events. Returning {} indicators in result set.".format(len(result_set)))
     return result_set, len(result_set)
 
-def push_to_sentinel(tenant, id, secret, workspace):
+def push_to_sentinel(tenant, id, secret, workspace, parsed_indicators=None, total_indicators=None):
     logging.info(f"Using Microsoft Upload Indicator API")
     config.ms_auth[TENANT] = tenant
     config.ms_auth[CLIENT_ID] = id
@@ -87,10 +97,15 @@ def push_to_sentinel(tenant, id, secret, workspace):
     logging.info(f"Tenant: {tenant}")
     logging.info(f"Client ID: {id}")
     logging.info(f"Workspace ID: {workspace}")
-    obfuscated_secret = secret[:-5] + '*' + '*' + '*' + '*' + '*'
+    obfuscated_secret = secret[:-5] + '*****'
     logging.info(f"Client Secret (obfuscated): {obfuscated_secret}")
-    parsed_indicators, total_indicators = _get_misp_events_stix()
-    logging.info("Found {} indicators in MISP".format(total_indicators))
+    
+    # Only fetch from MISP if indicators weren't provided
+    if parsed_indicators is None or total_indicators is None:
+        parsed_indicators, total_indicators = _get_misp_events_stix()
+        logging.info("Found {} indicators in MISP".format(total_indicators))
+    else:
+        logging.info("Using {} cached indicators from previous fetch".format(total_indicators))
 
     with RequestManager(total_indicators, tenant) as request_manager:
         logging.info("Start uploading indicators")
@@ -102,19 +117,30 @@ def push_to_sentinel(tenant, id, secret, workspace):
                 fp.write(json_formatted_str)
 
 def pmain():
-    ## Multi-tenant mode
-    tenants_env = os.getenv('tenants', '')
-    if not tenants_env == '':
-        tenants = json.loads(tenants_env)
-        for item in tenants:
-            push_to_sentinel(item['tenantId'], item['id'], item['secret'], item['workspaceId'])
+    tenants = json.loads(os.getenv('tenants', '[]'))
     
-    # Single-tenant mode
-    tenant = config.ms_auth[TENANT]
-    id = config.ms_auth[CLIENT_ID]
-    secret = config.ms_auth[CLIENT_SECRET]
-    workspace = config.ms_auth[WORKSPACE_ID]
-    push_to_sentinel(tenant, id, secret, workspace)
+    if tenants:  # Multi-tenant mode
+        # Fetch indicators once for all tenants
+        logging.info("Fetching MISP indicators once for all tenants")
+        parsed_indicators, total_indicators = _get_misp_events_stix()
+        logging.info("Found {} indicators in MISP".format(total_indicators))
+        
+        for item in tenants:
+            push_to_sentinel(
+                item['tenantId'], 
+                item['id'], 
+                item['secret'], 
+                item['workspaceId'],
+                parsed_indicators,
+                total_indicators
+            )
+    else:  # Single-tenant mode
+        push_to_sentinel(
+            config.ms_auth[TENANT],
+            config.ms_auth[CLIENT_ID],
+            config.ms_auth[CLIENT_SECRET],
+            config.ms_auth[WORKSPACE_ID]
+        )
 
 def main(mytimer: func.TimerRequest) -> None:
     utc_timestamp = datetime.utcnow().replace(
@@ -127,4 +153,3 @@ def main(mytimer: func.TimerRequest) -> None:
     pmain()
     logging.info("End MISP2Sentinel")
     logging.info('Python timer trigger function ran at %s', utc_timestamp)
-
