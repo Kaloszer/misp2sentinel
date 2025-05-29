@@ -1,6 +1,7 @@
 asn1crypto
 attrs
 azure-keyvault-secrets
+azure-functions
 azure-identity
 certifi
 charset-normalizer
@@ -29,3 +30,5 @@ urllib3
 virtualenv
 virtualenv-clone
 wrapt
+cffi
+cryptography

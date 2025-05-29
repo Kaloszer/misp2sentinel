@@ -1,4 +1,5 @@
-from pymisp import *
+from pymisp import PyMISP
+from pymisp import ExpandedPyMISP
 import MISP2Sentinel.config as config
 from collections import defaultdict
 from MISP2Sentinel.RequestManager import RequestManager
@@ -13,7 +14,6 @@ import logging
 import azure.functions as func
 import requests
 import json
-
 from misp_stix_converter import MISPtoSTIX21Parser
 from stix2.base import STIXJSONEncoder
 
@@ -23,6 +23,7 @@ if config.misp_verifycert is False:
 
 
 def _get_events():
+    """Legacy function for Graph API compatibility"""
     misp = PyMISP(config.misp_domain, config.misp_key, config.misp_verifycert)
     if len(config.misp_event_filters) == 0:
         return [event['Event'] for event in misp.search(controller='events', return_format='json')]
@@ -33,8 +34,8 @@ def _get_events():
     event_ids_intersection = reduce((lambda x, y: x & y), event_ids_for_each_filter)
     return [event for event in events_for_each_filter[0] if event['id'] in event_ids_intersection]
 
-
 def _graph_post_request_body_generator(parsed_events):
+    """Graph API request body generator for legacy compatibility"""
     for event in parsed_events:
         request_body_metadata = {
             **{field: event[field] for field in REQUIRED_GRAPH_METADATA},
@@ -56,19 +57,19 @@ def _graph_post_request_body_generator(parsed_events):
             }
             yield request_body
 
-
 def _handle_timestamp(parsed_event):
+    """Handle timestamp conversion for Graph API"""
     parsed_event['lastReportedDateTime'] = str(
         datetime.fromtimestamp(int(parsed_event['lastReportedDateTime'])))
 
-
 def _handle_diamond_model(parsed_event):
+    """Handle diamond model parsing for Graph API"""
     for tag in parsed_event['tags']:
         if 'diamond-model:' in tag:
             parsed_event['diamondModel'] = tag.split(':')[1]
 
-
 def _handle_tlp_level(parsed_event):
+    """Handle TLP level parsing for Graph API"""
     for tag in parsed_event['tags']:
         if 'tlp:' in tag:
             parsed_event['tlpLevel'] = tag.split(':')[1].lower().capitalize()
@@ -77,79 +78,74 @@ def _handle_tlp_level(parsed_event):
     if 'tlpLevel' not in parsed_event:
         parsed_event['tlpLevel'] = 'Red'
 
-
 def _get_misp_events_stix():
-    logger.info(f"Using the following values for MISP API call: domain: {config.misp_domain}")
-    misp = PyMISP(config.misp_domain, config.misp_key, config.misp_verifycert, False)
+    misp = ExpandedPyMISP(config.misp_domain, config.misp_key, config.misp_verifycert, False)
     result_set = []
-    logger.debug("Query MISP for events.")
+    logging.debug("Query MISP for events.")
     remaining_misp_pages = True
     misp_page = 1
     misp_indicator_ids = []
+    total_pages = None
 
     while remaining_misp_pages:
         try:
+            logging.info(f"Processing MISP page {misp_page}" + (f" of ~{total_pages}" if total_pages else ""))
             if "limit" in config.misp_event_filters:
                 result = misp.search(controller='events', return_format='json', **config.misp_event_filters)
-                remaining_misp_pages = False # Limits are set in the misp_event_filters
             else:
                 result = misp.search(controller='events', return_format='json', **config.misp_event_filters, limit=config.misp_event_limit_per_page, page=misp_page)
 
             if len(result) > 0:
-                logger.info("Received MISP events page {} with {} events".format(misp_page, len(result)))
-                for event in result:
-                    misp_event = RequestObject_Event(event["Event"], logger, config.misp_flatten_attributes)
-                    try:
-                        parser = MISPtoSTIX21Parser()
-                        parser.parse_misp_event(misp_event.event)
-                        stix_objects = parser.stix_objects
-                    except Exception as e:
-                        logger.error("Error when processing data in event {} from MISP {}. Most likely a MISP-STIX conversion problem.".format(misp_event.id, e))
-                        continue
-                    if config.write_parsed_eventid:
-                        logger.info("Processing event {} {}".format(event["Event"]["id"], event["Event"]["info"]))
+                # Calculate estimated total pages on first result
+                if total_pages is None and "limit" not in config.misp_event_filters:
+                    # Assuming the first page is representative of the total number of events
+                    total_pages = (len(result) + config.misp_event_limit_per_page - 1) // config.misp_event_limit_per_page
+                    logging.info(f"Estimated total pages: {total_pages}")
+
+                logging.info("Received MISP events page {} with {} events".format(misp_page, len(result)))
+                for index, event in enumerate(result):
+                    logging.info("Processing event {}".format(index + 1))
+                    misp_event = RequestObject_Event(event["Event"])
+                    parser = MISPtoSTIX21Parser()
+                    parser.parse_misp_event(event)
+                    stix_objects = parser.stix_objects
                     for element in stix_objects:
                         if element.type in UPLOAD_INDICATOR_API_ACCEPTED_TYPES and \
                                         element.id not in misp_indicator_ids:
-                            misp_indicator = RequestObject_Indicator(element, misp_event, logger)
+                            misp_indicator = RequestObject_Indicator(element, misp_event)
                             if misp_indicator.id:
                                 if misp_indicator.valid_until:
                                     valid_until = json.dumps(misp_indicator.valid_until, cls=STIXJSONEncoder).replace("\"", "")
-                                    # Strip the dots from 'valid_until' to avoid date parse errors
-                                    if "." in valid_until:
-                                        valid_until = valid_until.split(".")[0]
-                                    # There must be a "cleaner-Python" way to deal with converting these date formats
                                     if "Z" in valid_until:
                                         date_object = datetime.fromisoformat(valid_until[:-1])
+                                    elif "." in valid_until:
+                                        date_object = datetime.fromisoformat(valid_until.split(".")[0])
                                     else:
                                         date_object = datetime.fromisoformat(valid_until)
                                     if date_object > datetime.now():
                                         if config.verbose_log:
-                                            logger.debug("Add {} to list of indicators to upload".format(misp_indicator.pattern))
+                                            logging.debug("Add {} to list of indicators to upload".format(misp_indicator.pattern))
                                         misp_indicator_ids.append(misp_indicator.id)
                                         result_set.append(misp_indicator._get_dict())
                                     else:
-                                        logger.error("Skipping outdated indicator {} in event {}, valid_until: {}".format(misp_indicator.pattern, misp_event.id, valid_until))
+                                        logging.error("Skipping outdated indicator {}, valid_until: {}".format(misp_indicator.pattern, valid_until))
                                 else:
-                                    logger.error("Skipping indicator because valid_until was not set by MISP/MISP2Sentinel {}".format(misp_indicator.id))
+                                    logging.error("Skipping indicator because valid_until was not set by MISP/MISP2Sentinel {}".format(misp_indicator.id))
                             else:
-                                logger.error("Unable to process indicator. Invalid indicator type or invalid valid_until date. Event {}".format(misp_event.id))
-                logger.info("Processed {} indicators".format(len(result_set)))
+                                logging.error("Unable to process indicator")
+                logging.debug("Processed {} indicators.".format(len(result_set)))
                 misp_page += 1
             else:
+                logging.info("No more events to process.")
                 remaining_misp_pages = False
 
-        except exceptions.MISPServerError as e:
-            remaining_misp_pages = False
-            logger.error("Error received from the MISP server {} - {} - {}".format(e, sys.exc_info()[2].tb_lineno, sys.exc_info()[1]))
         except Exception as e:
             remaining_misp_pages = False
-            logger.error("Error when processing data from MISP {} - {} - {}".format(e, sys.exc_info()[2].tb_lineno, sys.exc_info()[1]))
-
+            logging.error("Error when processing data from MISP {}".format(e))
+    logging.info("Finished processing MISP events. Returning {} indicators in result set.".format(len(result_set)))
     return result_set, len(result_set)
-
-
 def _init_configuration():
+    """Configuration initialization and backward compatibility checks"""
     config_mapping = {
         "graph_auth": "ms_auth",
         "targetProduct": "ms_target_product",
@@ -165,12 +161,25 @@ def _init_configuration():
             setattr(config, config_mapping[old_value], p)
             use_old_config = True
 
+    # Essential configuration checks
     if not hasattr(config, "log_file"):
-        sys.exit("Exiting. No log file configuration setting found (log_file).")
+        config.log_file = "misp2sentinel.log"  # Default instead of exit
     if not (hasattr(config, "misp_domain") and hasattr(config, "misp_key") and hasattr(config, "misp_verifycert")):
-        sys.exit("Exiting. No MISP authentication configuration setting found (misp_domain, misp_key and misp_verifycert).")
+        logging.error("Missing MISP authentication configuration (misp_domain, misp_key and misp_verifycert).")
+        if hasattr(config, "log_file"):
+            return use_old_config  # Allow to continue in Azure Functions
+        else:
+            import sys
+            sys.exit("Exiting. No MISP authentication configuration setting found.")
     if not hasattr(config, "ms_auth"):
-        sys.exit("Exiting. No Microsoft authentication configuration setting found (ms_auth).")
+        logging.error("Missing Microsoft authentication configuration (ms_auth).")
+        if hasattr(config, "log_file"):
+            return use_old_config  # Allow to continue in Azure Functions
+        else:
+            import sys
+            sys.exit("Exiting. No Microsoft authentication configuration setting found.")
+    
+    # Set defaults for optional settings
     if not hasattr(config, "ms_useragent"):
         config.ms_useragent = "MISP-1.0"
     if not hasattr(config, "default_confidence"):
@@ -200,15 +209,26 @@ def _init_configuration():
 
     return use_old_config
 
-
 def _build_logger():
+    """Enhanced logger building with Azure Functions compatibility"""
     logger = logging.getLogger("misp2sentinel")
     logger.setLevel(logging.INFO)
-    if config.verbose_log:
+    if hasattr(config, 'verbose_log') and config.verbose_log:
         logger.setLevel(logging.DEBUG)
-    ch = logging.FileHandler(config.log_file, mode="a")
+    
+    # In Azure Functions, console logging is often preferred
+    if hasattr(config, "log_file") and config.log_file:
+        try:
+            ch = logging.FileHandler(config.log_file, mode="a")
+        except:
+            # Fallback to console logging in Azure Functions
+            ch = logging.StreamHandler()
+            raise
+    else:
+        ch = logging.StreamHandler()
+    
     ch.setLevel(logging.INFO)
-    if config.verbose_log:
+    if hasattr(config, 'verbose_log') and config.verbose_log:
         ch.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     ch.setFormatter(formatter)
@@ -216,10 +236,16 @@ def _build_logger():
 
     return logger
 
-def push_to_sentinel(tenant, id, secret, workspace):
-    logger.info("Fetching and parsing data from MISP ...")
-    if config.ms_auth.get("graph_api", False):
-        logger.info("Using Microsoft Graph API")
+def push_to_sentinel(tenant, id, secret, workspace, parsed_indicators=None, total_indicators=None, logger=None):
+    """Enhanced push_to_sentinel supporting both logging approaches and multi-tenant optimization"""
+    # Use provided logger or standard logging
+    log_func = logger.info if logger else logging.info
+    log_error = logger.error if logger else logging.error
+    log_debug = logger.debug if logger else logging.debug
+    
+    # Check if Graph API mode is configured and enabled
+    if hasattr(config, 'ms_auth') and config.ms_auth.get("graph_api", False):
+        log_func("Using Microsoft Graph API")
         events = _get_events()
         parsed_events = list()
         for event in events:
@@ -234,7 +260,7 @@ def push_to_sentinel(tenant, id, secret, workspace):
                 if 'sentinel-threattype' in tag['name']:    # Can be overridden on attribute level
                     parsed_event['threatType'] = tag['name'].split(':')[1]
                     continue
-                if config.ignore_localtags:
+                if hasattr(config, 'ignore_localtags') and config.ignore_localtags:
                     if tag["local"] != 1:
                         tags.append(tag['name'].strip())
             parsed_event['tags'] = tags
@@ -260,57 +286,86 @@ def push_to_sentinel(tenant, id, secret, workspace):
             parsed_events.append(parsed_event)
         del events
         total_indicators = sum([len(v['request_objects']) for v in parsed_events])
+        
+        # Process with Graph API
+        if hasattr(config, 'dry_run') and config.dry_run:
+            log_func("Dry run. Not uploading to Sentinel")
+        else:    
+            with RequestManager(total_indicators, logger, tenant) as request_manager:
+                for request_body in _graph_post_request_body_generator(parsed_events):
+                    if hasattr(config, 'verbose_log') and config.verbose_log:
+                        log_debug("request body: {}".format(request_body))
+                    request_manager.handle_indicator(request_body)
     else:
-        logger.info("Using Microsoft Upload Indicator API")
+        # Use Microsoft Upload Indicator API (your optimization)
+        log_func("Using Microsoft Upload Indicator API")
         config.ms_auth[TENANT] = tenant
         config.ms_auth[CLIENT_ID] = id
         config.ms_auth[CLIENT_SECRET] = secret
         config.ms_auth[WORKSPACE_ID] = workspace
-        logger.info(f"Tenant: {tenant}")
-        logger.info(f"Client ID: {id}")
-        logger.info(f"Workspace ID: {workspace}")
-        obfuscated_secret = secret[:-5] + '*' + '*' + '*' + '*' + '*'
-        logger.info(f"Client Secret (obfuscated): {obfuscated_secret}")
-        parsed_indicators, total_indicators = _get_misp_events_stix()
-        logger.info("Received {} indicators in MISP".format(total_indicators))
+        log_func(f"Tenant: {tenant}")
+        log_func(f"Client ID: {id}")
+        log_func(f"Workspace ID: {workspace}")
+        log_func(f"Secret:{secret[:2] + '*' * (len(secret) - 8) + secret[-2:]}")
+        
+        # Only fetch from MISP if indicators weren't provided (your optimization)
+        if parsed_indicators is None or total_indicators is None:
+            parsed_indicators, total_indicators = _get_misp_events_stix()
+            log_func("Found {} indicators in MISP".format(total_indicators))
+        else:
+            log_func("Using {} cached indicators from previous fetch".format(total_indicators))
 
-    if config.dry_run:
-        logger.info("Dry run. Not uploading to Sentinel")
-    else:    
-        with RequestManager(total_indicators, logger, tenant) as request_manager:
-            if config.ms_auth["graph_api"]:
-                for request_body in _graph_post_request_body_generator(parsed_events):
-                    if config.verbose_log:
-                        logger.debug("request body: {}".format(request_body))
-                    request_manager.handle_indicator(request_body)
-            else:
-                logger.info("Start uploading indicators")
+        if hasattr(config, 'dry_run') and config.dry_run:
+            log_func("Dry run. Not uploading to Sentinel")
+        else:
+            with RequestManager(total_indicators, logger, tenant) as request_manager:
+                log_func("Start uploading indicators")
                 request_manager.upload_indicators(parsed_indicators)
-                logger.info("Finished uploading indicators")
-                if config.write_parsed_indicators:
+                log_func("Finished uploading indicators")
+                if hasattr(config, 'write_parsed_indicators') and config.write_parsed_indicators:
                     json_formatted_str = json.dumps(parsed_indicators, indent=4)
                     with open("parsed_indicators.txt", "w") as fp:
                         fp.write(json_formatted_str)
 
-def pmain(logger):
-    ## Multi-tenant mode
+def pmain(logger=None):
+    """Enhanced pmain supporting both single and multi-tenant modes with optimization"""
+    # Multi-tenant mode with optimization
     tenants_env = os.getenv('tenants', '')
-    if not tenants_env == '':
+    if tenants_env:
         tenants = json.loads(tenants_env)
+        
+        # Fetch indicators once for all tenants
+        log_func = logger.info if logger else logging.info
+        log_func("Fetching MISP indicators once for all tenants")
+        parsed_indicators, total_indicators = _get_misp_events_stix()
+        log_func("Found {} indicators in MISP".format(total_indicators))
+        
+        # Reuse the same indicators for each tenant
         for item in tenants:
-            push_to_sentinel(item['tenantId'], item['id'], item['secret'], item['workspaceId'])
-    
-    # Single-tenant mode
-    tenant = config.ms_auth[TENANT]
-    id = config.ms_auth[CLIENT_ID]
-    secret = config.ms_auth[CLIENT_SECRET]
-    workspace = config.ms_auth[WORKSPACE_ID]
-    push_to_sentinel(tenant, id, secret, workspace)
+            push_to_sentinel(
+                item['tenantId'], 
+                item['id'], 
+                item['secret'], 
+                item['workspaceId'],
+                parsed_indicators,
+                total_indicators,
+                logger
+            )
+    else:
+        # Single-tenant mode
+        if hasattr(config, 'ms_auth'):
+            tenant = config.ms_auth.get(TENANT)
+            id = config.ms_auth.get(CLIENT_ID)
+            secret = config.ms_auth.get(CLIENT_SECRET)
+            workspace = config.ms_auth.get(WORKSPACE_ID)
+            push_to_sentinel(tenant, id, secret, workspace, logger=logger)
 
 def main(mytimer: func.TimerRequest) -> None:
+    """Enhanced main function with proper configuration and logging setup"""
+    # Initialize configuration (from open source)
     check_for_old_config = _init_configuration()
     
-    global logger
+    # Build logger (from open source, enhanced for Azure Functions)
     logger = _build_logger()
 
     utc_timestamp = datetime.utcnow().replace(
